@@ -18,13 +18,18 @@
 
 volatile sig_atomic_t running = 1;
 
+struct mctp_bench_send_args {
+        mctp_eid_t eid;
+        size_t len;
+        int net;
+};
+
 struct msg_header {
         uint8_t op_flag;
         uint32_t seq_no;
 };
 
 struct mctp_stats {
-        float throughput;
         double elapsed_time;
         unsigned long packets_dropped;
         unsigned long packets_count;
@@ -35,10 +40,38 @@ struct mctp_stats {
 };
 
 static const mctp_eid_t DEFAULT_EID = 8;
-static const int DEFAULT_SECONDS_INTERVAL = 10;
 static const size_t MSG_HEADER_SIZE = sizeof(struct msg_header);
+static const int DEFAULT_NET = 1;
+static const int DEFAULT_SECONDS_INTERVAL = 10;
 static const uint8_t SEND_TERMINATE_SIG = 0;
 static const uint8_t SEND_RUNNING_SIG = 1;
+
+static void print_stats(struct mctp_stats mctp_stats)
+{
+        float throughput = (float)mctp_stats.total_received_len /
+                           ((float)mctp_stats.elapsed_time * 1024);
+        printf("Throughput:%.2fkB/s | Recevied:%lupkts | "
+               "Dropped:%lupkts | "
+               "Invalid:%lupkts\n",
+               throughput, mctp_stats.packets_count, mctp_stats.packets_dropped,
+               mctp_stats.invalid_payloads);
+}
+
+static int get_elapsed_time(struct timespec start_time,
+                            struct timespec current_time)
+{
+        return (current_time.tv_sec - start_time.tv_sec) +
+               (current_time.tv_nsec - start_time.tv_nsec) / 1e9;
+}
+
+static int get_timeout(struct timespec start_time, struct timespec current_time)
+{
+        unsigned int current_sec = current_time.tv_sec;
+        unsigned int start_sec = start_time.tv_sec;
+        int time_to_print_sec =
+            (DEFAULT_SECONDS_INTERVAL) - (current_sec - start_sec);
+        return (time_to_print_sec > 0) ? time_to_print_sec * 1000 : 0;
+}
 
 static bool valid_payload(unsigned char *buf, size_t buflen)
 {
@@ -97,27 +130,22 @@ static int mctp_bench_recv()
 
         printf("recv: waiting for packets\n");
         while (1) {
-                int time_to_print;
+                int timeout;
                 struct pollfd pollfd[1];
                 pollfd[0].fd = sd;
                 pollfd[0].events = POLLIN;
-                // Calculate the time to next print.
+
                 if (started_recv_flag) {
                         clock_gettime(CLOCK_MONOTONIC, &current_time);
-                        unsigned int current_sec = current_time.tv_sec;
-                        unsigned int start_sec = start_time.tv_sec;
-                        int time_to_print_sec = (DEFAULT_SECONDS_INTERVAL) -
-                                                (current_sec - start_sec);
-                        time_to_print =
-                            (time_to_print > 0) ? time_to_print_sec * 1000 : 0;
+                        timeout = get_timeout(start_time, current_time);
                 } else {
-                        time_to_print = -1;
+                        timeout = -1;
                 }
 
-                rc = poll(pollfd, 1, time_to_print);
+                rc = poll(pollfd, 1, timeout);
                 if (rc < 0) {
                         warn("recv: poll failed");
-                        break;
+                        goto exit;
                 }
 
                 if (pollfd[0].revents & POLLIN) {
@@ -161,19 +189,7 @@ static int mctp_bench_recv()
 
                         hdr = (struct msg_header *)buf;
                         if (hdr->op_flag == SEND_TERMINATE_SIG) {
-                                printf("recv: sender terminating signal "
-                                       "received\n");
-
-                                addr.smctp_tag &= ~MCTP_TAG_OWNER;
-
-                                rc = sendto(sd, buf, buflen, 0,
-                                            (struct sockaddr *)&addr,
-                                            sizeof(addr));
-                                if (rc != (int)mctp_stats.curr_packet_len) {
-                                        warn("recv: sendto");
-                                }
-                                printf("recv: ACK sent\n");
-                                break;
+                                goto sender_terminated;
                         }
 
                         mctp_stats.total_received_len +=
@@ -188,6 +204,7 @@ static int mctp_bench_recv()
                                 clock_gettime(CLOCK_MONOTONIC, &start_time);
                                 continue;
                         }
+
                         seq_diff =
                             get_diff(hdr->seq_no, mctp_stats.prev_seq_no);
                         if (seq_diff > 1)
@@ -196,22 +213,10 @@ static int mctp_bench_recv()
                 }
 
                 clock_gettime(CLOCK_MONOTONIC, &current_time);
-
                 mctp_stats.elapsed_time =
-                    (current_time.tv_sec - start_time.tv_sec) +
-                    (current_time.tv_nsec - start_time.tv_nsec) / 1e9;
-                // Print out the throughputs
+                    get_elapsed_time(start_time, current_time);
                 if (mctp_stats.elapsed_time >= DEFAULT_SECONDS_INTERVAL) {
-                        mctp_stats.throughput =
-                            (float)mctp_stats.total_received_len /
-                            ((float)mctp_stats.elapsed_time * 1024);
-                        printf("Throughput:%.2fkB/s | Recevied:%lupkts | "
-                               "Dropped:%lupkts | "
-                               "Invalid:%lupkts\n",
-                               mctp_stats.throughput, mctp_stats.packets_count,
-                               mctp_stats.packets_dropped,
-                               mctp_stats.invalid_payloads);
-
+                        print_stats(mctp_stats);
                         mctp_stats.total_received_len = 0;
                         mctp_stats.packets_count = 0l;
                         mctp_stats.packets_dropped = 0l;
@@ -220,12 +225,23 @@ static int mctp_bench_recv()
                 }
         }
 
+sender_terminated:
+        printf("recv: sender terminating signal "
+               "received\n");
+        addr.smctp_tag &= ~MCTP_TAG_OWNER;
+
+        rc = sendto(sd, buf, buflen, 0, (struct sockaddr *)&addr, sizeof(addr));
+        if (rc != (int)mctp_stats.curr_packet_len) {
+                warn("recv: sendto");
+        }
+        printf("recv: ACK sent\n");
+exit:
         free(buf);
         close(sd);
         return EXIT_SUCCESS;
 }
 
-static int mctp_bench_send(mctp_eid_t eid, size_t len, int net)
+static int mctp_bench_send(struct mctp_bench_send_args send_args)
 {
         struct sockaddr_mctp addr;
         struct sigaction act;
@@ -237,14 +253,12 @@ static int mctp_bench_send(mctp_eid_t eid, size_t len, int net)
         int rc, sd, last_rc;
 
         struct mctp_ioc_tag_ctl2 ctl = {
-            .peer_addr = eid,
-            .net = net,
+            .peer_addr = send_args.eid,
+            .net = send_args.net,
         };
 
-        if (len < sizeof(struct msg_header))
-                buflen = MSG_HEADER_SIZE;
-        else
-                buflen = len;
+        buflen =
+            (send_args.len < MSG_HEADER_SIZE) ? MSG_HEADER_SIZE : send_args.len;
 
         sd = socket(AF_MCTP, SOCK_DGRAM, 0);
         if (sd < 0)
@@ -253,11 +267,11 @@ static int mctp_bench_send(mctp_eid_t eid, size_t len, int net)
         memset(&addr, 0x0, sizeof(addr));
         addrlen = sizeof(addr);
         addr.smctp_family = AF_MCTP;
-        addr.smctp_network = net;
-        addr.smctp_addr.s_addr = eid;
+        addr.smctp_network = send_args.net;
+        addr.smctp_addr.s_addr = send_args.eid;
         addr.smctp_type = 1;
-        printf("sending to eid:%d, net:%d, type %d\n", eid,
-               (net == 0) ? 1 : net, addr.smctp_type);
+        printf("send: to eid %d, net %d, type %d\n", send_args.eid,
+               send_args.net, addr.smctp_type);
 
         buf = malloc(buflen);
         if (!buf)
@@ -341,20 +355,20 @@ exit:
         return EXIT_SUCCESS;
 }
 
-static void usage(void)
+static void recv_usage(void) { fprintf(stderr, "'mctp-bench recv'\n"); }
+
+static void send_usage(void)
 {
-        fprintf(stderr, "Usage:\n");
-        fprintf(stderr,
-                "  mctp-bench recv|send --size=SIZE eid [<NET>],<EID>\n");
-        fprintf(stderr, "  Defaults: eid=%d, size=%zd\n", DEFAULT_EID,
+        fprintf(stderr, "'mctp-bench send --size=SIZE eid [<NET>],[<EID>]'\n");
+        fprintf(stderr, "defaults: eid=%d, size=%zd\n", DEFAULT_EID,
                 MSG_HEADER_SIZE);
 }
 
-bool send_set_net_and_eid(int *mctp_net, mctp_eid_t *eid, char *opt)
+bool send_set_net_and_eid(struct mctp_bench_send_args *send_args, char *opt)
 {
         char *comma;
-        int tmp_int;
         char *endptr;
+        int tmp;
 
         for (size_t i = 0; i < strlen(opt); i++) {
                 if ((opt[i] < '0' || opt[i] > '9') && opt[i] != ',')
@@ -362,48 +376,44 @@ bool send_set_net_and_eid(int *mctp_net, mctp_eid_t *eid, char *opt)
         }
         comma = strchr(opt, ',');
 
-        if (comma) {
-                errno = 0;
-                tmp_int = strtoul(opt, &endptr, 10);
-                if (errno == ERANGE)
-                        err(EXIT_FAILURE, "strtol");
-                if (endptr == opt)
-                        return false;
-                *mctp_net = tmp_int;
+        errno = 0;
+        tmp = strtoul(opt, &endptr, 10);
+        if (errno == ERANGE)
+                err(EXIT_FAILURE, "strtol");
+        if (endptr == opt)
+                return false;
 
+        if (comma) {
+                send_args->net = tmp;
                 comma++;
 
                 errno = 0;
-                tmp_int = strtoul(comma, &endptr, 10);
+                tmp = strtoul(comma, &endptr, 10);
                 if (errno == ERANGE)
                         err(EXIT_FAILURE, "strtol");
                 if (endptr == comma || *endptr != '\0')
                         return false;
-                *eid = tmp_int;
-        } else {
-                errno = 0;
-                tmp_int = strtoul(opt, &endptr, 10);
-                if (errno == ERANGE)
-                        err(EXIT_FAILURE, "strtol");
-                if (endptr == comma || *endptr != '\0')
-                        return false;
-                *eid = tmp_int;
         }
-
+        send_args->eid = tmp;
         return true;
 }
 
 int main(int argc, char **argv)
 {
-        mctp_eid_t eid = DEFAULT_EID;
-        int net = 1;
-        size_t size = MSG_HEADER_SIZE;
+        struct mctp_bench_send_args send_args = {
+            .eid = DEFAULT_EID,
+            .len = MSG_HEADER_SIZE,
+            .net = DEFAULT_NET,
+        };
         char *endptr, *optname, *optval;
         int command = 0;
 
-        if (argc < 2) {
-                fprintf(stderr, "Error: Missing command\n");
-                usage();
+        if (argc < 2 || argc > 5) {
+                fprintf(stderr, "%s\n",
+                        (argc < 2) ? "Error: Missing command"
+                                   : "Error: Too many arguments");
+                recv_usage();
+                send_usage();
                 return 255;
         }
 
@@ -413,24 +423,18 @@ int main(int argc, char **argv)
                 command = 2;
         else {
                 fprintf(stderr, "Error: Unknown command: %s\n", argv[1]);
-                usage();
+                recv_usage();
+                send_usage();
                 return 255;
         }
 
         switch (command) {
         case 1: // send
-                if (argc > 5) {
-                        fprintf(stderr, "Error: Too many argument for send\n");
-                        usage();
-                        return 255;
-                }
-
                 for (int i = 2; i < argc; i++) {
                         optname = argv[i];
-
                         if (strcmp(optname, "eid") == 0) {
                                 optval = argv[i + 1];
-                                if (!send_set_net_and_eid(&net, &eid, optval))
+                                if (!send_set_net_and_eid(&send_args, optval))
                                         errx(EXIT_FAILURE,
                                              "invalid eid or net value %s",
                                              optval);
@@ -442,28 +446,29 @@ int main(int argc, char **argv)
                                         errx(EXIT_FAILURE,
                                              "invalid size value %s", optval);
 
-                                if (tmp >= MSG_HEADER_SIZE)
-                                        size = tmp;
+                                if (tmp > MSG_HEADER_SIZE)
+                                        send_args.len = tmp;
                                 else {
-                                        printf("Min size = 4, setting size to "
-                                               "4\n");
-                                        size = MSG_HEADER_SIZE;
+                                        printf(
+                                            "Min size=%zd, size set to %zd\n",
+                                            MSG_HEADER_SIZE, MSG_HEADER_SIZE);
+                                        send_args.len = MSG_HEADER_SIZE;
                                 }
                         } else {
-                                fprintf(stderr, "Error: Unknown argument: %s\n",
+                                fprintf(stderr, "send: unknown argument: %s\n",
                                         optname);
-                                usage();
+                                send_usage();
                                 return 255;
                         }
                 }
 
-                return mctp_bench_send(eid, size, net);
+                return mctp_bench_send(send_args);
 
         case 2: // recv
                 if (argc > 2) {
                         fprintf(stderr,
-                                "Error: recv does not take any arguments\n");
-                        usage();
+                                "recv: does not take extra arguments\n");
+                        recv_usage();
                         return 255;
                 }
 
@@ -471,7 +476,8 @@ int main(int argc, char **argv)
 
         default:
                 fprintf(stderr, "Error: Invalid command\n");
-                usage();
+                recv_usage();
+                send_usage();
                 return 255;
         }
 
